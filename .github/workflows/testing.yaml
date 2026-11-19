@@ -1,0 +1,172 @@
+---
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2025 The Linux Foundation
+
+# Action test/validation workflow
+name: "Test GitHub Action 🧪"
+
+# yamllint disable-line rule:truthy
+on:
+  workflow_dispatch:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+concurrency:
+  group: "${{ github.workflow }}-${{ github.ref }}"
+  cancel-in-progress: true
+
+permissions: {}
+
+jobs:
+  ### Test the GitHub Action in this Repository ###
+  tests:
+    name: "Test local GitHub Action"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 10 # Increase this timeout value as needed
+    steps:
+      # Load the egress allow-list out-of-band from the
+      # organisation's .github repository and publish it as
+      # $CONNECTION_ALLOW_LIST for the harden-runner step below.
+      # yamllint disable-line rule:line-length
+      - uses: lfreleng-actions/harden-runner-block-action@65ff87957e1cac2de3203a85dbb07c31810321cb  # v0.16.4
+        with:
+          config: '@56d70f0eae78f334a598d1ffe071d4b821517b22'  # v0.17.1
+
+      # Harden the runner with the just-loaded allow-list.
+      - name: 'Harden runner (block)'
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a  # v2.22.4
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      - name: "Checkout repository"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: "Run publish.sh self-test"
+        shell: bash
+        run: bash tests/test_publish.sh
+
+      - name: "Create test m2repo"
+        shell: bash
+        run: |
+          # Create test m2repo
+          d=m2repo/org/example/app/1.0.0
+          mkdir -p "$d"
+          touch "$d/app-1.0.0.jar" "$d/app-1.0.0.pom" "$d/app-1.0.0.jar.sha1"
+
+      - name: "Running local action: dry run"
+        id: dry-run
+        uses: $/
+        with:
+          artifactory_url: "https://example.jfrog.io"
+          repository: "libs-release-local"
+          files_path: "m2repo"
+          dry_run: "true"
+
+      - name: "Validate dry run count"
+        shell: bash
+        env:
+          COUNT: ${{ steps.dry-run.outputs.dry_run_count }}
+        run: |
+          # Validate dry run count
+          if [ "$COUNT" != "2" ]; then
+            echo "Error: expected dry_run_count 2, got '$COUNT' ❌"
+            exit 1
+          fi
+
+      - name: "Running local action: live run without token [Failure]"
+        id: failure
+        uses: $/
+        continue-on-error: true
+        with:
+          artifactory_url: "https://example.jfrog.io"
+          repository: "libs-release-local"
+          files_path: "m2repo"
+
+      - name: "Error if step above did NOT fail"
+        if: steps.failure.outcome == 'success'
+        shell: bash
+        run: |
+          # Error if step above did NOT fail
+          echo "Error: previous test step did NOT fail ❌"
+          exit 1
+
+  ### Live upload; opt in by setting the ARTIFACTORY_URL variable ###
+  integration:
+    name: "Live upload to Artifactory"
+    if: vars.ARTIFACTORY_URL != ''
+    # Scopes the token to a dedicated environment; fork PRs get no secrets
+    environment: integration-auto
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 10
+    env:
+      REPO_KEY: ${{ vars.ARTIFACTORY_REPOSITORY }}
+      GROUP_PATH: "org/lfreleng/test/artifactory-publish-action"
+      VERSION: "0.0.${{ github.run_id }}-${{ github.run_attempt }}"
+    steps:
+      # Audit only: the Artifactory host is per-repository configuration
+      # yamllint disable-line rule:line-length
+      - uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a  # v2.22.4
+        with:
+          egress-policy: 'audit'
+
+      - name: "Checkout repository"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: "Create test m2repo"
+        shell: bash
+        run: |
+          # Create test m2repo with a unique version per run
+          d="m2repo/${GROUP_PATH}/${VERSION}"
+          mkdir -p "$d"
+          echo "jar" > "$d/artifactory-publish-action-${VERSION}.jar"
+          echo "pom" > "$d/artifactory-publish-action-${VERSION}.pom"
+          sha1sum "$d/artifactory-publish-action-${VERSION}.jar" \
+            > "$d/artifactory-publish-action-${VERSION}.jar.sha1"
+
+      - name: "Running local action: live upload"
+        id: live
+        uses: $/
+        with:
+          artifactory_url: ${{ vars.ARTIFACTORY_URL }}
+          access_token: ${{ secrets.ARTIFACTORY_ACCESS_TOKEN }}
+          repository: ${{ vars.ARTIFACTORY_REPOSITORY }}
+          files_path: "m2repo"
+
+      - name: "Validate upload"
+        shell: bash
+        env:
+          COUNT: ${{ steps.live.outputs.publication_count }}
+        run: |
+          # Validate upload count and presence in the repository
+          set -euo pipefail
+          if [ "$COUNT" != "2" ]; then
+            echo "Error: expected publication_count 2, got '$COUNT' ❌"
+            exit 1
+          fi
+          found=$(jf rt search --count \
+            "${REPO_KEY}/${GROUP_PATH}/${VERSION}/*")
+          if [ "$found" != "2" ]; then
+            echo "Error: expected 2 artifacts in ${REPO_KEY}, got '$found' ❌"
+            exit 1
+          fi
+          echo "Uploaded and found ${found} artifacts ✅"
+
+      - name: "Remove test artifacts"
+        if: always() && steps.live.outcome != 'skipped'
+        shell: bash
+        run: |
+          # Remove test artifacts
+          jf rt delete --quiet "${REPO_KEY}/${GROUP_PATH}/${VERSION}/" || true

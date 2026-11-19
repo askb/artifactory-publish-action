@@ -1,0 +1,90 @@
+---
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 The Linux Foundation
+
+# artifactory-publish-action
+name: '🐸 Artifactory Publishing'
+description: 'Uploads a Maven repository tree (m2repo) to JFrog Artifactory'
+# Artifactory has no Nexus-style staging (close/rules/drop): upload
+# straight to the target repository; promotion, if wanted, is a copy
+
+inputs:
+  # Mandatory
+  artifactory_url:
+    description: 'JFrog platform URL (e.g. https://example.jfrog.io)'
+    required: true
+  repository:
+    description: 'Target repository key (e.g. libs-release-local)'
+    required: true
+  files_path:
+    description: 'Directory holding the Maven layout to upload (m2repo)'
+    required: true
+  # Optional
+  access_token:
+    # Checked at runtime: required unless dry_run is true
+    description: 'Artifactory access token; required unless dry_run is true'
+    required: false
+  upload_path:
+    description: 'Path prefix within the repository; default is the root'
+    required: false
+    default: ''
+  dry_run:
+    # Only true or false (any case); anything else fails before upload
+    description: 'List what would upload, without any network requests'
+    required: false
+    default: 'false'
+
+outputs:
+  publication_count:
+    description: 'Number of files uploaded'
+    value: "${{ steps.publish.outputs.publication_count }}"
+  failed_count:
+    description: 'Number of files that failed to upload'
+    value: "${{ steps.publish.outputs.failed_count }}"
+  dry_run_count:
+    description: 'Number of files a dry run would upload (0 otherwise)'
+    value: "${{ steps.publish.outputs.dry_run_count }}"
+
+runs:
+  using: 'composite'
+  steps:
+    - name: 'Validate inputs'
+      id: validate
+      shell: bash
+      env:
+        ARTIFACTORY_URL: "${{ inputs.artifactory_url }}"
+        ACCESS_TOKEN: "${{ inputs.access_token }}"
+        REPOSITORY: "${{ inputs.repository }}"
+        FILES_PATH: "${{ inputs.files_path }}"
+        UPLOAD_PATH: "${{ inputs.upload_path }}"
+        DRY_RUN: "${{ inputs.dry_run }}"
+      run: |
+        # Validate inputs
+        "$GITHUB_ACTION_PATH/scripts/publish.sh" validate
+
+    - name: 'Setup JFrog CLI'
+      if: steps.validate.outputs.dry_run == 'false'
+      # yamllint disable-line rule:line-length
+      uses: jfrog/setup-jfrog-cli@4c2f06da03095113100534a16d58d8a252680949  # v5.3.5
+      env:
+        JF_URL: "${{ inputs.artifactory_url }}"
+        JF_ACCESS_TOKEN: "${{ inputs.access_token }}"
+      with:
+        # ponytail: plain upload, no build-info; these post steps need
+        # platform permissions a project-scoped token lacks
+        disable-auto-build-publish: 'true'
+        disable-auto-evidence-collection: 'true'
+
+    - name: 'Publish to Artifactory'
+      id: publish
+      shell: bash
+      env:
+        ARTIFACTORY_URL: "${{ inputs.artifactory_url }}"
+        ACCESS_TOKEN: "${{ inputs.access_token }}"
+        REPOSITORY: "${{ inputs.repository }}"
+        FILES_PATH: "${{ inputs.files_path }}"
+        UPLOAD_PATH: "${{ inputs.upload_path }}"
+        DRY_RUN: "${{ inputs.dry_run }}"
+      run: |
+        # Publish to Artifactory
+        "$GITHUB_ACTION_PATH/scripts/publish.sh" publish
